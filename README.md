@@ -6,9 +6,12 @@ a boundary you can test, not one you have to trust.
 
 <p align="center"><img src="docs/how-it-works.svg" alt="You write on your devices; the vault on your server is kept identical; at 3 am the librarian works on a photocopy, thinks with Claude, and files a report on GitHub that you read in the morning" width="860"></p>
 
-The same picture with every component named, and one entry per component:
-[docs/how-it-works.html](docs/how-it-works.html) (open it in a browser, or
-serve `docs/` with GitHub Pages).
+The same system with every component named. Dashed boxes are yours to bring.
+
+<p align="center"><img src="docs/components.svg" alt="Devices sync to a server holding the vault, its daily note, config and an optional stop file; the nightly runs the model in a worktree under a guard with rule files, talks to Claude, opens a PR on GitHub and pings a healthcheck" width="860"></p>
+
+One entry per component, with the diagrams: [docs/how-it-works.html](docs/how-it-works.html)
+(open it in a browser, or serve `docs/` with GitHub Pages).
 
 ## The two ideas
 
