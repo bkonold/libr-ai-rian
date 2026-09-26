@@ -5,7 +5,7 @@ On the server, as a user with sudo. About fifteen minutes, one model call.
 ## 1. Run the installer
 
 ```bash
-git clone https://github.com/bkonold/libr-ai-rian git clone https://github.com/<you>/librarian && cd librariangit clone https://github.com/<you>/librarian && cd librarian cd libr-ai-rian
+git clone https://github.com/bkonold/libr-ai-rian && cd libr-ai-rian
 sudo bash ./install.sh
 ```
 
