@@ -4,6 +4,12 @@ A nightly job that files your one-line captures into an Obsidian vault, as a
 pull request you read over coffee. The model that does the filing runs inside
 a boundary you can test, not one you have to trust.
 
+<p align="center"><img src="docs/how-it-works.svg" alt="You write on your devices; the vault on your server is kept identical; at 3 am the librarian works on a photocopy, thinks with Claude, and files a report on GitHub that you read in the morning" width="860"></p>
+
+The same picture with every component named, and one entry per component:
+[docs/how-it-works.html](docs/how-it-works.html) (open it in a browser, or
+serve `docs/` with GitHub Pages).
+
 ## The two ideas
 
 **Propose, then review, with git as the record.** You jot lines under
@@ -81,7 +87,7 @@ the boundary for your own layout.
 | `lib/` | `guard`, `settings.sh`: the kit |
 | `prompts/` | `file.md`, `tidy.md` |
 | `vault/` | rule files, indexes, template, lessons stub, gitignore installed into the vault |
-| `docs/` | architecture, boundaries, daily note, operations, vault structure |
+| `docs/` | architecture, boundaries, daily note, operations, vault structure; `how-it-works.html` for people |
 | `examples/` | a night's inputs and outputs, from the offline simulator |
 
 `CLAUDE.md` is for an agent working on this repo. MIT license.
