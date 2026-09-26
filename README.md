@@ -1,4 +1,4 @@
-# librarian
+# libr-ai-rian
 
 A nightly job that files your one-line captures into an Obsidian vault, as a
 pull request you read over coffee. The model that does the filing runs inside
