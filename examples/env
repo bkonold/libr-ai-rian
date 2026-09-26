@@ -1,0 +1,8 @@
+VAULT_DIR='/srv/vault'
+WORK_CO='acme'
+YOU_NAME='Sam Example'
+YOU_EMAIL='sam@example.com'
+GITHUB_REPO='sam-example/vault'
+HC_URL='https://hc-ping.com/00000000-0000-0000-0000-000000000000'
+STOP_FLAG='/var/lib/backup/STOP'
+CLAUDE_BIN='/home/librarian/.local/share/claude/versions/2.1.281'

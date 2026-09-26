@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Create tomorrow's daily note from the template so it exists on every device
+# before morning. Runs as librarian from librarian-newday.timer at 00:05.
+#   librarian-newday [YYYY-MM-DD]     (default: today, since it runs just after midnight)
+set -euo pipefail
+# shellcheck disable=SC1091
+. /etc/librarian/env
+VAULT=${VAULT_DIR:?VAULT_DIR missing from /etc/librarian/env}
+DATE=${1:-$(date +%F)}
+exec /usr/local/lib/librarian/dailynote.py new "$VAULT/templates/daily.md" "$VAULT/daily/${DATE:0:4}/$DATE.md" "$DATE"

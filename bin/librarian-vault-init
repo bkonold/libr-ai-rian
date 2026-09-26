@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Lay out a vault for the librarian: realm folders, rule files, indexes, the
+# daily-note template, Obsidian's daily-note setting, and a git repo on main.
+# Nothing existing is moved or overwritten; run it on an empty directory or
+# on a vault you have already arranged (docs/vault-structure.md). Runs as
+# librarian, from install.sh or by hand:  sudo -u librarian -H librarian-vault-init
+set -euo pipefail
+# shellcheck disable=SC1091
+. /etc/librarian/env
+VAULT=${VAULT_DIR:?VAULT_DIR missing from /etc/librarian/env}; WORK_CO=${WORK_CO:?WORK_CO missing from /etc/librarian/env}
+LIB=/usr/local/lib/librarian
+cd "$VAULT"
+
+if [ -f personal/CLAUDE.md ]; then echo "already initialised (personal/CLAUDE.md exists); skipping"; exit 0; fi
+
+for d in personal/projects personal/areas personal/trips personal/journal personal/attachments \
+         "work/$WORK_CO/people" "work/$WORK_CO/meetings" "work/$WORK_CO/projects" "work/$WORK_CO/areas" \
+         "work/$WORK_CO/reference" "work/$WORK_CO/attachments" daily templates .obsidian; do
+  mkdir -p "$d"
+done
+
+sub() { [ -e "$2" ] || sed "s/{{WORK_CO}}/$WORK_CO/g" "$LIB/vault/$1" > "$2"; }
+sub CLAUDE.md CLAUDE.md
+sub personal-CLAUDE.md personal/CLAUDE.md
+sub work-CLAUDE.md "work/$WORK_CO/CLAUDE.md"
+sub index-personal.md personal/index.md
+sub index-work.md "work/$WORK_CO/index.md"
+sub daily.md templates/daily.md
+sub lessons.md personal/lessons.md
+sub lessons.md "work/$WORK_CO/lessons.md"
+
+# index entries for notes that already exist (a vault arranged by hand)
+python3 - "$WORK_CO" <<'PY'
+import pathlib, sys
+realms = {"personal": ["areas", "projects", "trips", "journal"],
+          f"work/{sys.argv[1]}": ["people", "meetings", "projects", "areas", "reference"]}
+for realm, kinds in realms.items():
+    idx = pathlib.Path(realm) / "index.md"; text = idx.read_text()
+    for kind in kinds:
+        names = sorted(p.stem for p in (pathlib.Path(realm) / kind).glob("*.md"))
+        block = "".join(f"- [[{n}]]\n" for n in names)
+        text = text.replace(f"## {kind.capitalize()}\n", f"## {kind.capitalize()}\n{block}")
+    idx.write_text(text)
+PY
+
+# Obsidian: daily notes live in daily/YYYY/, created by the newday timer
+[ -e .obsidian/daily-notes.json ] || cat > .obsidian/daily-notes.json <<'EOT'
+{ "folder": "daily", "format": "YYYY/YYYY-MM-DD", "template": "templates/daily", "autorun": false }
+EOT
+
+if [ ! -d .git ]; then
+  git init -q -b main; git config user.name librarian; git config user.email librarian@localhost
+fi
+[ -e .gitignore ] || cp "$LIB/vault/gitignore" .gitignore
+git add -A
+git diff --cached --quiet || git commit -q -m "vault layout for the librarian"
+echo "initialised $VAULT: personal/, work/$WORK_CO/, daily/, templates/; $(git rev-list --count HEAD) commit(s)"

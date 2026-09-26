@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""PreToolUse hook: THE decision on every file tool call the model makes.
+
+Claude Code runs this before Read/Edit/Write/Glob/Grep with the call as JSON
+on stdin. Exit 2 = deny (stderr goes back to the model), exit 0 = allow.
+Any other outcome (crash, timeout) would let the call through, so every
+error path here ends in deny: the guard fails closed. It resolves symlinks
+and `..`, and logs every allowed write so the wrapper knows exactly which
+paths the model touched (LIBRARIAN_WRITES_LOG).
+
+Rules, in one place:
+  writes  only under the realm dir; never journal/, dot-files, instruction files
+  reads   only under the realm's top folder, plus the root CLAUDE.md
+  search  Glob/Grep need a path; patterns must be relative
+
+Environment (set by claude_confined in settings.sh):
+  LIBRARIAN_VAULT      vault root (realpath)
+  LIBRARIAN_REALM_DIR  the only writable tree, relative to the vault (e.g. personal, work/acme)
+  LIBRARIAN_WRITES_LOG file to append written paths to (optional)
+  LIBRARIAN_GUARD_LOG  file to append denied calls to, "Tool path" (optional)
+"""
+import json, os, sys
+
+READ_TOOLS = {"Read", "Glob", "Grep"}
+WRITE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+# Files other agents obey (whatever runs on the owner's own devices):
+# the model never writes them, anywhere. Lessons live in lessons.md instead.
+INSTRUCTION_FILES = {"claude.md", "claude.local.md", "agents.md", ".mcp.json"}
+
+TOOL, RAW = "?", ""
+
+def deny(msg):
+    sys.stderr.write("librarian guard: " + msg + "\n")
+    log = os.environ.get("LIBRARIAN_GUARD_LOG")      # the wrapper merges this into the denials list
+    if log:
+        with open(log, "a") as f:
+            f.write(f"{TOOL} {RAW}\n")
+    sys.exit(2)
+
+def main():
+    try:
+        call = json.load(sys.stdin)
+    except Exception:
+        deny("unreadable hook input")
+    global TOOL, RAW
+    tool = TOOL = call.get("tool_name", "")
+    inp = call.get("tool_input") or {}
+    RAW = inp.get("file_path") or inp.get("notebook_path") or inp.get("path") or inp.get("pattern") or ""
+    vault = os.environ.get("LIBRARIAN_VAULT"); realm_dir = os.environ.get("LIBRARIAN_REALM_DIR")
+    if not vault or not realm_dir:
+        deny("LIBRARIAN_VAULT / LIBRARIAN_REALM_DIR not set")
+    vault = os.path.realpath(vault)
+    realm = os.path.join(vault, realm_dir)
+
+    if tool in WRITE_TOOLS:
+        raw = inp.get("file_path") or inp.get("notebook_path")
+        if not raw:
+            deny("write without a path")
+    elif tool in READ_TOOLS:
+        raw = inp.get("file_path") or inp.get("path")
+        # a search pattern that is itself a path (absolute, ~ or ..) escapes the path argument
+        for key in ("pattern", "glob"):
+            pat = inp.get(key) or ""
+            if pat.startswith(("/", "~")) or ".." in pat.split("/"):
+                deny(f"{key}={pat!r} must be relative and inside the vault")
+        if not raw:
+            if tool in ("Glob", "Grep"):
+                deny(f"pass path= under {os.path.relpath(realm, vault)}/ (searching the whole vault is not allowed)")
+            deny("read without a path")
+    else:
+        return  # not a file tool; deny rules decide
+
+    p = os.path.join(vault, os.path.expanduser(raw))
+    # resolve symlinks in every existing component, then `..` in the rest.
+    # lexists, not exists: a dangling symlink (target not created yet) must
+    # still be followed, or a link out of the realm would look like a path in it.
+    head, tail = p, []
+    while not os.path.lexists(head) and head not in ("", "/"):
+        head, last = os.path.split(head); tail.insert(0, last)
+    resolved = os.path.normpath(os.path.join(os.path.realpath(head), *tail))
+
+    inside = lambda root: resolved == root or resolved.startswith(root + os.sep)
+    parts = resolved[len(vault) + 1:].split(os.sep) if inside(vault) else []
+
+    if not inside(vault):
+        deny(f"{raw} is outside the vault")
+    if any(x.lower() == "journal" for x in parts):
+        if tool in WRITE_TOOLS:
+            deny(f"{raw} is in a journal folder (never written)")
+    if tool in WRITE_TOOLS:
+        if not inside(realm):
+            deny(f"{raw} is outside {os.path.relpath(realm, vault)}/ (the only writable tree)")
+        if any(x.startswith(".") for x in parts):
+            deny(f"{raw}: dot-files and dot-folders (.git, .claude, .obsidian, ...) are never written")
+        if parts and parts[-1].lower() in INSTRUCTION_FILES:
+            deny(f"{raw}: instruction files are never written; lessons go in lessons.md")
+        log = os.environ.get("LIBRARIAN_WRITES_LOG")
+        if log:
+            with open(log, "a") as f:
+                f.write(os.path.relpath(resolved, vault) + "\n")
+        return
+    # reads: the realm's top (personal/ or work/) and the root CLAUDE.md only
+    top = os.path.join(vault, os.path.relpath(realm, vault).split(os.sep)[0])
+    if inside(top) or resolved == os.path.join(vault, "CLAUDE.md"):
+        return
+    deny(f"{raw} is outside {os.path.relpath(top, vault)}/ (reads are confined to the realm)")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as e:                 # fail closed
+        deny(f"guard error: {e!r}")

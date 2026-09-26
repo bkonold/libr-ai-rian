@@ -1,0 +1,383 @@
+#!/usr/bin/env bash
+# The nightly librarian run. Runs as user `librarian` from librarian-nightly.timer
+# (03:00, processing yesterday) or by hand for testing.
+#
+#   librarian-nightly [--date YYYY-MM-DD] [--realm personal|work] [--no-github]
+#                     [--no-tidy] [--dry-run]
+#
+#   --date       which daily note to process (default: yesterday)
+#   --realm      only this realm (default: both)
+#   --no-github  commit and merge locally; no push, no PRs (offline testing)
+#   --no-tidy    skip the tidy proposal
+#   --dry-run    extract material and print the prompt; change nothing
+#
+# Three history points per night: (1) "you: DATE" commit of the owner's edits,
+# (2) one filing PR (a commit per realm) merged immediately, (3) an optional tidy PR left open.
+# See docs/architecture.md (how a night runs) and docs/vault-structure.md.
+#
+# The model never runs inside the vault. The vault is a synced folder, so
+# anything written there reaches the owner's devices within seconds; the model
+# works in a git worktree of the vault's repo next to the vault, and the
+# vault itself only ever moves forward by a fast-forward pull of main.
+set -Eeuo pipefail   # -E: the ERR trap below also fires inside functions
+
+CONF=/etc/librarian                  # root-owned; the librarian user reads, never writes
+LIB=/usr/local/lib/librarian
+STATE=/var/lib/librarian
+RUNS=$STATE/runs
+LOGDIR=/var/log/librarian
+
+DATE=$(date -d yesterday +%F)
+REALMS=(personal work)
+GITHUB=1; TIDY=1; DRY=0
+while [ $# -gt 0 ]; do
+  case $1 in
+    --date) DATE=$2; shift 2;;
+    --realm) REALMS=("$2"); shift 2;;
+    --no-github) GITHUB=0; shift;;
+    --no-tidy) TIDY=0; shift;;
+    --dry-run) DRY=1; shift;;
+    *) echo "unknown arg $1"; exit 2;;
+  esac
+done
+
+# shellcheck disable=SC1091
+. "$CONF/env"             # VAULT_DIR, WORK_CO, YOU_NAME, YOU_EMAIL, GITHUB_REPO, HC_URL, STOP_FLAG, CLAUDE_BIN
+VAULT=${VAULT_DIR:?VAULT_DIR missing from $CONF/env}
+STOPFLAG=${STOP_FLAG:-}   # optional: the run refuses to start while this file exists (e.g. a backup tripwire)
+WORK=$(dirname "$VAULT")/librarian   # librarian-owned, next to the vault; the deny rules cover /var, so not under /var/lib
+WT=$WORK/worktree                    # where the model works: a checkout of the vault's repo, not synced
+CLAUDE=${CLAUDE_BIN:-/home/librarian/.local/bin/claude}
+# shellcheck disable=SC1091
+. "$LIB/settings.sh"      # make_settings, claude_confined, tool lists
+# The token is read per call and never exported: the model process must not inherit it.
+gh() { GH_TOKEN=$(cat "$CONF/github-token") command gh "$@"; }
+[ -s "$CONF/github-token" ] && [ -n "${GITHUB_REPO:-}" ] || GITHUB=0
+
+mkdir -p "$RUNS/$DATE" "$LOGDIR"
+LOG=$LOGDIR/nightly-$DATE.log
+exec > >(tee -a "$LOG") 2>&1
+echo "=== $(date -Is) librarian-nightly date=$DATE realms=${REALMS[*]} github=$GITHUB tidy=$TIDY dry=$DRY"
+echo "claude: $CLAUDE ($("$CLAUDE" --version 2>/dev/null || echo unknown))"
+
+hc() { [ -n "${HC_URL:-}" ] && curl -fsS -m 10 --retry 3 "$HC_URL$1" ${2:+--data-raw "$2"} >/dev/null || true; }
+
+# worktree_open branch: a fresh checkout of main at $WT on a new branch, and
+# cd into it. worktree_close: back to the vault, the worktree is deleted.
+# Whatever happened in between, the vault's files were never touched.
+worktree_open() {
+  cd "$VAULT"
+  git worktree remove --force "$WT" 2>/dev/null || rm -rf "$WT"; git worktree prune
+  git branch -D "$1" >/dev/null 2>&1 || true
+  git worktree add -q -B "$1" "$WT" main; chmod 750 "$WT"
+  cd "$WT"
+}
+worktree_close() {
+  cd "$VAULT"
+  git worktree remove --force "$WT" 2>/dev/null || true
+}
+# On any failure: drop the worktree. Nothing half-done can be left in the vault.
+abort_run() { worktree_close; }
+fail() { echo "FAILED: $*"; abort_run; hc /fail "librarian-nightly $DATE: $*"; exit 1; }
+trap 'echo "error at line $LINENO"; abort_run; hc /fail "librarian-nightly $DATE failed at line $LINENO; see $LOG"' ERR
+
+cd "$VAULT"
+[ -n "$STOPFLAG" ] && [ -e "$STOPFLAG" ] && { echo "$STOPFLAG present (stop file); not running."; exit 0; }
+git config core.fsmonitor false      # never run a monitor a nested repo might declare
+exec 9>"$STATE/lock"; flock -n 9 || { echo "another run holds the lock"; exit 0; }
+NOTE=daily/${DATE:0:4}/$DATE.md
+[ -f "$NOTE" ] || { echo "no daily note $NOTE; nothing to do"; exit 0; }
+if [ "$DRY" = 0 ]; then
+  [ -s "$HOME/.claude/.credentials.json" ] || fail "librarian is not logged in to Claude Code (sudo -u librarian -H bash -c 'cd && /home/librarian/.local/bin/claude', then /exit)"
+  # --restricted ignores these, but a settings file synced into the vault could
+  # carry hooks; refuse rather than rely on one flag.
+  S=$(ls .claude/settings*.json .mcp.json CLAUDE.local.md 2>/dev/null || true)
+  [ -z "$S" ] || fail "config file inside the vault ($S); remove it (keep it in .stignore)"
+fi
+
+realm_heading() { case $1 in personal) echo Personal;; work) echo Work;; esac; }
+realm_dir()     { case $1 in personal) echo personal;; work) echo "work/$WORK_CO";; esac; }
+
+render() {  # template -> stdout with {{KEY}} replaced from env vars given as KEY=VALUE args
+  python3 - "$@" <<'PY'
+import sys, pathlib
+tmpl = pathlib.Path(sys.argv[1]).read_text()
+for kv in sys.argv[2:]:
+    k, v = kv.split("=", 1)
+    tmpl = tmpl.replace("{{%s}}" % k, v.replace("</", "<\\/").replace("{{", "{ {"))
+sys.stdout.write(tmpl)
+PY
+}
+
+section_after() {  # heading file: print lines after the LAST '## heading' up to the next '## '
+  awk -v h="## $1" 'BEGIN{p=0} $0==h{p=1; buf=""; next} p&&/^## /{p=0} p{buf=buf $0 "\n"} END{printf "%s", buf}' "$2"
+}
+
+run_claude() {  # prompt_file settings_file out_file(.md)  -> also out.json/.denials/.writes/.err
+  local out=${3%.md} tok=""
+  # work realm on a work account (Team/Enterprise token from `claude setup-token`) when the file exists
+  [ "$REALM" = work ] && [ -s "$CONF/work-token" ] && tok=$(cat "$CONF/work-token")
+  LIBRARIAN_OAUTH_TOKEN=$tok claude_confined "$1" "$2" "$out" 80 "$RD" || { cat "$out.err"; echo "claude failed$(claude_login_hint "$out.err")"; return 1; }
+  if [ -s "$out.denials" ]; then
+    echo "denied $(wc -l < "$out.denials") tool call(s):"; sed 's/^/  /' "$out.denials"
+  fi
+  WRITES=$out.writes
+}
+
+# verify_run realm_dir writes_log: after a model run, look at every change in
+# the worktree (git status) and attribute it with the guard's log of what
+# the model wrote. Sets two outcomes the PR reports:
+#   REVERTED  the model wrote where it must not (outside the realm dir, journal,
+#             dot-files, instruction files) or deleted something: undone.
+#             Should be impossible (the guard denies it); if it happens the
+#             guard failed and the PR is left open.
+#   HELD      the model's text contains a remote embed (<img>, ![](http...)):
+#             kept, but the PR is left open for the owner to look at.
+# Nobody else writes in the worktree, so a change the guard did not log is
+# the model's and counts as REVERTED too.
+# Paths from git are NUL-separated; note names may contain spaces.
+verify_run() {
+  local rd=$1 log=$2 e st p; local -a bad=() deleted=() ok=()
+  declare -A wrote=(); while IFS= read -r p; do [ -n "$p" ] && wrote[$p]=1; done < <(sort -u "$log" 2>/dev/null)
+  while IFS= read -r -d '' e; do
+    st=${e:0:2}; p=${e:3}
+    if [ -n "${wrote[$p]:-}" ]; then
+      case "${p,,}" in
+        "$rd"/*) case "${p,,}" in */journal/*|*/.*|*/claude.md|*/claude.local.md|*/agents.md) bad+=("$p");; *) ok+=("$p");; esac;;
+        *) bad+=("$p");;
+      esac
+    elif [[ $st == *D* ]] && [[ $p == "$rd"/* ]]; then deleted+=("$p")
+    else bad+=("$p")
+    fi
+  done < <(git status --porcelain -z -uall)   # -uall: list files inside new folders, not the folder
+  while IFS= read -r -d '' p; do bad+=("$p"); done < <(find "$rd" -name .git -prune -print0 2>/dev/null)
+  if [ ${#bad[@]} -gt 0 ]; then
+    echo "REVERTED: changes the model must not make (guard failure?):"; printf '  %s\n' "${bad[@]}"
+    revert_paths "${bad[@]}"; REVERTED=1
+  fi
+  if [ ${#deleted[@]} -gt 0 ]; then
+    echo "REVERTED: deletions restored:"; printf '  %s\n' "${deleted[@]}"
+    git checkout -q -- "${deleted[@]}"; REVERTED=1
+  fi
+  local embeds
+  embeds=$(for p in "${ok[@]}"; do
+    { if git ls-files --error-unmatch -- "$p" >/dev/null 2>&1; then git diff -- "$p"; else git diff --no-index /dev/null "$p" 2>/dev/null; fi; } | grep -E '^\+' | grep -iE '!\[[^]]*\]\( *(https?:)?//|<(img|iframe|script|embed|object|link|video|audio)\b' | sed "s|^|  $p: |" || true   # no match is not an error
+  done | sort -u)
+  [ -n "$embeds" ] && { echo "HELD: remote embeds in the model's text; PR left open:"; echo "$embeds"; HELD=1; }
+  true
+}
+revert_paths() {  # tracked -> checkout, untracked -> remove
+  local p
+  for p in "$@"; do
+    if git ls-files --error-unmatch -- "$p" >/dev/null 2>&1; then git checkout -q -- "$p"; else rm -rf -- "$p"; fi
+  done
+}
+
+pr_comments() {  # pr_number -> markdown lines
+  [ "$GITHUB" = 1 ] && [ -n "$1" ] || return 0
+  local owner=${GITHUB_REPO%%/*}   # only the owner's comments are instructions
+  gh api "repos/$GITHUB_REPO/pulls/$1/comments" --jq ".[] | select(.user.login == \"$owner\") | \"- [\\(.path):\\(.line // .original_line // \"?\")] \\(.body)\"" 2>/dev/null || true
+  gh api "repos/$GITHUB_REPO/issues/$1/comments" --jq ".[] | select(.user.login == \"$owner\") | \"- \\(.body)\"" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------- 0. sync + you (in the vault: commits and fast-forwards only)
+git config user.name >/dev/null || git config user.name librarian
+git config user.email >/dev/null || git config user.email "librarian@localhost"
+[ "$(git branch --show-current)" = main ] || fail "the vault is not on main; put it back by hand"
+if [ "$GITHUB" = 1 ]; then
+  git pull -q --ff-only origin main || fail "git pull --ff-only failed (diverged?)"
+fi
+YOU_COMMIT=""
+git add -A
+if ! git diff --cached --quiet; then
+  [ "$DRY" = 1 ] && { echo "[dry-run] would commit owner edits:"; git diff --cached --stat; git reset -q; } || {
+    git commit -q --author="$YOU_NAME <$YOU_EMAIL>" -m "you: $DATE"
+    YOU_COMMIT=$(git rev-parse HEAD)
+    echo "history point 1: you: $DATE ($YOU_COMMIT)"
+    [ "$GITHUB" = 1 ] && git push -q origin main
+  }
+fi
+hc /start
+
+# ---------------------------------------------------------------- 1. per realm: material, prompt, confined run
+# One branch and one PR for the night. Each realm still gets its own confined
+# model run (only its folder writable) and its own commit on that branch.
+BR=librarian/$DATE
+LAST_PR=$(cat "$STATE/last-pr" 2>/dev/null || true)
+pr_comments "$LAST_PR" > "$RUNS/$DATE/feedback.md"        # every owner comment on last night's PR
+declare -A RAN=() DID=() TOUCHED_OF=()   # per realm: the prompt ran / a commit was made / files the owner touched
+REVERTED=0; HELD=0; WARNED=0              # set by verify_run / the heading check; one flag each for the whole night
+[ "$DRY" = 1 ] || worktree_open "$BR"     # from here on, cwd is the worktree
+for REALM in "${REALMS[@]}"; do
+  H=$(realm_heading "$REALM"); RD=$(realm_dir "$REALM")
+  RUN=$RUNS/$DATE/$REALM; mkdir -p "$RUN"
+  echo "--- realm $REALM ($RD)"
+
+  "$LIB/dailynote.py" extract "$NOTE" "$H" "To file" > "$RUN/material.md" || {   # exit 3: heading missing
+    echo "WARN: no '### To file' under '## $H' in $NOTE (template changed?); nothing extracted for $REALM"; WARNED=1; }
+  # a comment on a file goes to that file's realm; a general comment to every realm
+  grep -E "^- (\[$RD/|[^[])" "$RUNS/$DATE/feedback.md" > "$RUN/feedback.md" || true
+  TOUCHED=""
+  [ -n "$YOU_COMMIT" ] && TOUCHED=$(git show --name-only --pretty=format: "$YOU_COMMIT" -- "$RD" ':!*/journal/*' | grep -v '^$' || true)
+  TOUCHED_OF[$REALM]=$TOUCHED
+  printf '%s\n' "$TOUCHED" > "$RUN/touched.txt"
+  : > "$RUN/you-diff.patch"
+  [ -n "$YOU_COMMIT" ] && git show --pretty=format: "$YOU_COMMIT" -- "$RD" ':!*/journal/*' > "$RUN/you-diff.patch" || true
+
+  if [ ! -s "$RUN/material.md" ] && [ ! -s "$RUN/feedback.md" ] && [ -z "$TOUCHED" ]; then
+    echo "nothing to file, no feedback, nothing touched; skipping"; continue
+  fi
+
+  render "$LIB/prompts/file.md" "REALM_DIR=$RD" "DATE=$DATE" \
+    "FEEDBACK=$(cat "$RUN/feedback.md")" "MATERIAL=$(cat "$RUN/material.md")" \
+    "TOUCHED=$TOUCHED" > "$RUN/prompt.md"
+  make_settings "$RD" "$RUN/settings.json"
+
+  if [ "$DRY" = 1 ]; then
+    echo "[dry-run] prompt for $REALM:"; echo "----------"; cat "$RUN/prompt.md"; echo "----------"; continue
+  fi
+
+  RAN[$REALM]=1
+  run_claude "$RUN/prompt.md" "$RUN/settings.json" "$RUN/output.md" || fail "claude run failed for $REALM"
+  verify_run "$RD" "$WRITES"      # nothing outside the realm, nothing deleted; may set REVERTED / HELD
+  git add -A -- "$RD"
+  if git diff --cached --quiet; then echo "agent changed nothing in $RD"; continue; fi
+  git commit -q -m "librarian($REALM): $DATE"; DID[$REALM]=1
+done
+[ "$DRY" = 1 ] && { echo "=== $(date -Is) done (dry run)"; exit 0; }
+
+# ---------------------------------------------------------------- 2. the PR, then the daily-note close-out
+if [ ${#DID[@]} -eq 0 ]; then
+  # nothing to review: no PR (GitHub refuses one without commits); close out the daily note on main, in the vault
+  worktree_close; git branch -q -D "$BR"
+  for REALM in "${REALMS[@]}"; do
+    [ -n "${RAN[$REALM]:-}" ] || continue
+    H=$(realm_heading "$REALM")
+    "$LIB/dailynote.py" clear "$NOTE" "$H" "To file" "- "
+    "$LIB/dailynote.py" filed "$NOTE" "- **$H** nothing to file"
+  done
+  if [ ${#RAN[@]} -gt 0 ]; then
+    git add -- "$NOTE"; git commit -q -m "librarian: $DATE daily note (nothing filed)"
+    [ "$GITHUB" = 1 ] && git push -q origin main
+  fi
+  echo "history point 2: nothing filed"
+  [ "$REVERTED" = 1 ] && hc /fail "librarian-nightly $DATE: reverted a write outside the realm (nothing filed); see $LOG"
+else
+  PRNUM=""; PRURL=""
+  if [ "$GITHUB" = 1 ]; then
+    git push -q -u origin "$BR"
+    {
+      echo "Nightly filing for $DATE, daily note \`$NOTE\`."
+      [ "$REVERTED" = 1 ] && echo -e "\n> **REVERTED**: the model changed something it must not (see the run log); undone. The guard should have denied it: run librarian-boundary-test. **Left open for you.**"
+      [ "$HELD" = 1 ] && echo -e "\n> **HELD**: the model's text contains a remote embed (see the run log). Nothing reverted. **Left open for you.**"
+      for REALM in "${REALMS[@]}"; do
+        [ -n "${RAN[$REALM]:-}" ] || continue
+        H=$(realm_heading "$REALM"); RUN=$RUNS/$DATE/$REALM
+        echo -e "\n# $H\n"; section_after Notes "$RUN/output.md" | grep . || echo "- nothing to note"
+      done
+      echo -e "\n# Files\n"; echo '```'; git diff --stat main..HEAD; echo '```'
+      C=$(cd "$VAULT" && find . -name '*.sync-conflict-*' -not -path './.st*' | head -20); [ -n "$C" ] && { echo -e "\n## Sync conflicts to resolve\n"; echo "$C" | sed 's/^/- /'; }
+      echo -e "\nRun log: \`$LOG\` on the server."
+    } > "$RUNS/$DATE/pr-body.md"
+    PRURL=$(gh pr create --base main --head "$BR" --title "librarian: $DATE" --body-file "$RUNS/$DATE/pr-body.md")
+    PRNUM=${PRURL##*/}
+    REF="[PR #$PRNUM]($PRURL)"
+  else
+    REF="commit $(git rev-parse --short HEAD)"
+  fi
+
+  for REALM in "${REALMS[@]}"; do
+    [ -n "${RAN[$REALM]:-}" ] || continue
+    H=$(realm_heading "$REALM"); RD=$(realm_dir "$REALM")
+    "$LIB/dailynote.py" clear "$NOTE" "$H" "To file" "- "
+    if [ -n "${DID[$REALM]:-}" ]; then
+      # Filed = the PR link and a wikilink per note this realm's commit created or changed (from git, not the model's report)
+      LINKS=()
+      while IFS= read -r n; do
+        [ -n "$n" ] || continue; b=${n##*/}; LINKS+=("  - [[${n%.md}|${b%.md}]]")
+      done < <(git diff --name-only main -- "$RD" | grep '\.md$' | grep -vE '/(index|lessons)\.md$' || true)
+      "$LIB/dailynote.py" filed "$NOTE" "- **$H** $REF" "${LINKS[@]}"
+    else
+      "$LIB/dailynote.py" filed "$NOTE" "- **$H** nothing to file"
+    fi
+  done
+  git add -- "$NOTE"; git commit -q -m "librarian: $DATE daily note"
+
+  if [ "$GITHUB" = 1 ]; then
+    git push -q origin "$BR"
+    echo "$PRNUM" > "$STATE/last-pr"
+    worktree_close                         # back in the vault, which has not changed since the you-commit
+    if [ "$REVERTED" = 1 ] || [ "$HELD" = 1 ]; then
+      echo "history point 2: $PRURL (left open, not merged)"; hc /fail "librarian-nightly $DATE: PR left open (reverted=$REVERTED held=$HELD)"
+    else
+      # GitHub recomputes mergeability for a few seconds after a push; "not mergeable" right away is that, not a conflict
+      for i in 1 2 3 4 5 6; do
+        gh pr merge "$PRNUM" --merge >/dev/null 2>&1 && break
+        [ "$i" = 6 ] && fail "could not merge $PRURL after 30s"; sleep 5
+      done
+      git push -q origin --delete "$BR"; git branch -q -D "$BR"
+      git pull -q --ff-only origin main    # the only way the vault's files ever change in this script
+      echo "history point 2: $PRURL (merged)"
+    fi
+  else
+    worktree_close
+    if [ "$REVERTED" = 1 ] || [ "$HELD" = 1 ]; then echo "history point 2: $BR left unmerged"
+    else git merge -q --ff-only "$BR"; git branch -q -d "$BR"; echo "history point 2: merged $BR locally"; fi
+  fi
+fi
+
+# ---------------------------------------------------------------- 3. tidy proposal: one PR, left open
+if [ "$TIDY" = 1 ]; then
+  TPR=$(cat "$STATE/tidy-pr" 2>/dev/null || true); SKIP=0
+  if [ "$GITHUB" = 1 ] && [ -n "$TPR" ]; then
+    TSTATE=$(gh pr view "$TPR" --json state,createdAt --jq '.state+" "+.createdAt' 2>/dev/null || echo "GONE")
+    if [ "${TSTATE%% *}" = OPEN ]; then
+      AGE=$(( ( $(date +%s) - $(date -d "${TSTATE#* }" +%s) ) / 86400 ))
+      if [ "$AGE" -ge 2 ]; then
+        gh pr close "$TPR" --delete-branch -c "Expired after $AGE days; re-proposed tonight if still relevant." >/dev/null
+      else
+        echo "tidy: PR #$TPR still open ($AGE d); not proposing another"; SKIP=1
+      fi
+    fi
+  fi
+  if [ "$SKIP" = 0 ]; then
+    TB=librarian/tidy/$DATE
+    worktree_open "$TB"                    # the proposal is made in the worktree; the vault never sees it
+    PROPOSED=0
+    for REALM in "${REALMS[@]}"; do
+      TOUCHED=${TOUCHED_OF[$REALM]:-}
+      [ -n "$TOUCHED" ] || { echo "tidy($REALM): nothing touched; skipping"; continue; }
+      H=$(realm_heading "$REALM"); RD=$(realm_dir "$REALM"); RUN=$RUNS/$DATE/$REALM
+      render "$LIB/prompts/tidy.md" "REALM_DIR=$RD" "DATE=$DATE" "TOUCHED=$TOUCHED" \
+        "DIFF=$(head -c 60000 "$RUN/you-diff.patch")" > "$RUN/tidy-prompt.md"
+      run_claude "$RUN/tidy-prompt.md" "$RUN/settings.json" "$RUN/tidy-output.md" || { echo "tidy($REALM): run failed; skipping"; mapfile -t W < <(sort -u "$RUN/tidy-output.writes" 2>/dev/null); [ ${#W[@]} -gt 0 ] && revert_paths "${W[@]}"; continue; }
+      verify_run "$RD" "$WRITES"
+      git add -A -- "$RD"
+      if git diff --cached --quiet; then echo "tidy($REALM): nothing to propose"; continue; fi
+      git commit -q -m "librarian tidy($REALM): $DATE"; PROPOSED=1
+    done
+    if [ "$PROPOSED" = 0 ]; then
+      worktree_close; git branch -q -D "$TB"
+    elif [ "$GITHUB" = 1 ]; then
+      git push -q -u origin "$TB"
+      { echo "Proposed refilings for $DATE. Merge to accept, ignore to reject (expires after two nights)."
+        for REALM in "${REALMS[@]}"; do
+          RUN=$RUNS/$DATE/$REALM; [ -s "$RUN/tidy-output.md" ] || continue
+          echo -e "\n# $(realm_heading "$REALM")\n"; section_after Proposed "$RUN/tidy-output.md"
+        done
+        echo -e "\n# Files\n"; echo '```'; git diff --stat main..HEAD; echo '```'; } > "$RUNS/$DATE/tidy-pr-body.md"
+      TURL=$(gh pr create --base main --head "$TB" --title "tidy: $DATE" --body-file "$RUNS/$DATE/tidy-pr-body.md")
+      echo "${TURL##*/}" > "$STATE/tidy-pr"
+      echo "history point 3: $TURL (open)"
+      worktree_close
+    else
+      echo "history point 3: tidy proposal left on local branch $TB"
+      worktree_close
+    fi
+  fi
+fi
+
+# run artifacts hold copies of note text; keep a month
+find "$RUNS" -mindepth 1 -maxdepth 1 -type d -mtime +30 -exec rm -rf {} + 2>/dev/null || true
+if [ "$WARNED" = 1 ]; then hc /fail "librarian-nightly $DATE: daily note headings missing (see log)"; else hc "" "librarian-nightly $DATE ok"; fi
+echo "=== $(date -Is) done"

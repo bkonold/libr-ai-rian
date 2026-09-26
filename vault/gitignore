@@ -1,0 +1,14 @@
+# What git must never commit: Syncthing's own files and temp files, Obsidian's
+# per-device state and plugin code, agent caches and config. Notes and
+# attachments are everything else.
+.stfolder/
+.stversions/
+.trash/
+.obsidian/workspace*.json
+.obsidian/plugins/
+.claude/
+.DS_Store
+*.tmp
+*.sync-conflict-*
+.syncthing.*.tmp
+~syncthing~*.tmp
