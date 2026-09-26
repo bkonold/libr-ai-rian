@@ -5,7 +5,7 @@ On the server, as a user with sudo. About fifteen minutes, one model call.
 ## 1. Run the installer
 
 ```bash
-git clone https://github.com/<you>/librarian && cd librarian
+git clone https://github.com/bkonold/libr-ai-rian git clone https://github.com/<you>/librarian && cd librariangit clone https://github.com/<you>/librarian && cd librarian cd libr-ai-rian
 sudo bash ./install.sh
 ```
 
@@ -76,7 +76,7 @@ run at once. That is harmless.
 ## Upgrading
 
 ```bash
-cd librarian && git pull && sudo bash ./install.sh     # disarms the nightly timer
+cd libr-ai-rian && git pull && sudo bash ./install.sh     # disarms the nightly timer
 sudo -u librarian -H librarian-boundary-test           # PASS, then
 sudo systemctl enable --now librarian-nightly.timer
 ```
